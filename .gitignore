@@ -1,0 +1,27 @@
+# dependencies
+**/node_modules
+
+# build & cache
+.next
+dist
+build
+.turbo
+coverage
+
+# environment
+.env
+.env.*
+
+# logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# editor
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# os & misc
+.DS_Store
+*.swp

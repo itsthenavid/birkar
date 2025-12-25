@@ -1,0 +1,12 @@
+packages:
+  - web/apps/*
+  - web/packages/*
+  - api/apps/*
+  - api/packages/*
+  - infra/*
+  - docs
+
+ignoredBuiltDependencies:
+  - '@nestjs/core'
+  - sharp
+  - unrs-resolver
