@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: birkar-postgres
+    environment:
+      POSTGRES_DB: birkar
+      POSTGRES_USER: birkar
+      POSTGRES_PASSWORD: birkar_dev_password
+    ports:
+      - "5433:5432"
+    volumes:
+      - birkar_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U birkar -d birkar"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: birkar-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - birkar_redisdata:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  birkar_pgdata:
+  birkar_redisdata:
