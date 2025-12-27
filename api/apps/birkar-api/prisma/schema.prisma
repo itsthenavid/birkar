@@ -5,3 +5,449 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+/**
+ * ─────────────────────────────
+ * Enums
+ * ─────────────────────────────
+ */
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum TokenPurpose {
+  VERIFY_EMAIL
+  RESET_PASSWORD
+  CHANGE_EMAIL
+}
+
+enum TokenStatus {
+  ACTIVE
+  USED
+  REVOKED
+  EXPIRED
+}
+
+enum WriterRequestStatus {
+  PENDING
+  APPROVED
+  DENIED
+  CANCELED
+}
+
+enum WriterInviteStatus {
+  ACTIVE
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
+enum AuditSeverity {
+  INFO
+  WARN
+  SECURITY
+}
+
+enum AuditAction {
+  AUTH_REGISTER
+  AUTH_LOGIN
+  AUTH_LOGOUT
+  AUTH_LOGOUT_ALL
+  AUTH_SESSION_REVOKED
+
+  EMAIL_VERIFY_REQUESTED
+  EMAIL_VERIFIED
+
+  PASSWORD_RESET_REQUESTED
+  PASSWORD_RESET_COMPLETED
+
+  CHANGE_EMAIL_REQUESTED
+  CHANGE_EMAIL_COMPLETED
+
+  WRITER_REQUEST_CREATED
+  WRITER_REQUEST_CANCELED
+  WRITER_REQUEST_APPROVED
+  WRITER_REQUEST_DENIED
+
+  WRITER_INVITE_CREATED
+  WRITER_INVITE_REVOKED
+  WRITER_INVITE_ACCEPTED
+}
+
+/**
+ * ─────────────────────────────
+ * Base: Users / Profiles
+ * ─────────────────────────────
+ */
+
+model User {
+  id String @id @default(cuid())
+
+  // Enterprise: case-insensitive uniqueness via CITEXT
+  username String @unique @db.Citext
+  email    String @unique @db.Citext
+
+  emailVerifiedAt DateTime?
+  passwordHash    String? // null when created purely by OAuth initially
+  status          UserStatus @default(ACTIVE)
+
+  avatarUrl String?
+  bio       String?
+
+  // timestamps
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime? // soft delete for safety/audit
+
+  // relations
+  profile Profile?
+
+  sessions      Session[]
+  oauthAccounts OAuthAccount[]
+  tokens        AuthToken[]
+
+  roles UserRole[]
+
+  followers Follow[] @relation("followers")
+  following Follow[] @relation("following")
+
+  writerRequests        WriterAccessRequest[]
+  writerRequestsDecided WriterAccessRequest[] @relation("writerRequestsDecidedBy")
+  writerInvitesCreated  WriterInvite[]        @relation("writerInvitesCreatedBy")
+  writerInvitesAccepted WriterInvite[]        @relation("inviteAcceptedBy")
+
+  badges UserBadge[]
+
+  auditLogsAsActor  AuditLog[] @relation("auditActor")
+  auditLogsAsTarget AuditLog[] @relation("auditTarget")
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([deletedAt])
+}
+
+model Profile {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  displayName String?
+  location    String?
+  website     String?
+  isPublic    Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/**
+ * ─────────────────────────────
+ * Social: Follow
+ * ─────────────────────────────
+ */
+
+model Follow {
+  id          String   @id @default(cuid())
+  followerId  String
+  followingId String
+  createdAt   DateTime @default(now())
+
+  follower  User @relation("following", fields: [followerId], references: [id], onDelete: Cascade)
+  following User @relation("followers", fields: [followingId], references: [id], onDelete: Cascade)
+
+  @@unique([followerId, followingId])
+  @@index([followingId])
+  @@index([followerId])
+}
+
+/**
+ * ─────────────────────────────
+ * RBAC (Role/Permission)
+ * ─────────────────────────────
+ */
+
+model Role {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  description String?
+
+  permissions RolePermission[]
+  users       UserRole[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Permission {
+  id          String  @id @default(cuid())
+  key         String  @unique
+  description String?
+
+  roles RolePermission[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+}
+
+model UserRole {
+  userId String
+  roleId String
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  assignedAt DateTime @default(now())
+  assignedBy String? // optional: admin userId for audit, keep string to avoid circular strictness
+
+  @@id([userId, roleId])
+  @@index([roleId])
+  @@index([assignedAt])
+}
+
+/**
+ * ─────────────────────────────
+ * Auth: Sessions (DB sessions + metadata)
+ * ─────────────────────────────
+ */
+
+model Session {
+  id        String @id @default(cuid())
+  userId    String
+  tokenHash String @unique
+
+  createdAt  DateTime  @default(now())
+  lastSeenAt DateTime  @default(now())
+  expiresAt  DateTime
+  revokedAt  DateTime?
+
+  ip         String?
+  userAgent  String?
+  deviceId   String?
+  deviceName String?
+  platform   String?
+  country    String?
+  city       String?
+
+  rotatedFromSessionId String?
+  rotatedFrom          Session?  @relation("sessionRotation", fields: [rotatedFromSessionId], references: [id], onDelete: SetNull)
+  rotatedTo            Session[] @relation("sessionRotation")
+
+  user   User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokens AuthToken[]
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+  @@index([lastSeenAt])
+  @@index([deviceId])
+}
+
+/**
+ * ─────────────────────────────
+ * Auth: OAuth Accounts
+ * ─────────────────────────────
+ */
+
+model OAuthAccount {
+  id     String @id @default(cuid())
+  userId String
+
+  provider   String // "google" (future: github, apple, ...)
+  providerId String // provider user id (sub)
+  email      String? @db.Citext // provider email (optional but useful)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  revokedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerId])
+  @@index([userId])
+  @@index([provider])
+  @@index([email])
+}
+
+/**
+ * ─────────────────────────────
+ * Auth: Tokens (verify/reset/change email)
+ * ─────────────────────────────
+ */
+
+model AuthToken {
+  id        String       @id @default(cuid())
+  userId    String
+  purpose   TokenPurpose
+  tokenHash String       @unique
+
+  status TokenStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+
+  usedAt    DateTime?
+  revokedAt DateTime?
+
+  // bind to a session optionally (security)
+  sessionId String?
+  session   Session? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  // metadata for security/audit
+  ip        String?
+  userAgent String?
+  meta      Json?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+  @@index([expiresAt])
+  @@index([status])
+  @@index([sessionId])
+}
+
+/**
+ * ─────────────────────────────
+ * Writer Access Gating
+ * ─────────────────────────────
+ */
+
+model WriterAccessRequest {
+  id     String @id @default(cuid())
+  userId String
+
+  message String?
+  status  WriterRequestStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  decidedAt    DateTime?
+  decidedById  String?
+  decisionNote String?
+
+  user      User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  decidedBy User? @relation("writerRequestsDecidedBy", fields: [decidedById], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model WriterInvite {
+  id String @id @default(cuid())
+
+  email     String             @db.Citext
+  tokenHash String             @unique
+  status    WriterInviteStatus @default(ACTIVE)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  createdById String
+  createdBy   User   @relation("writerInvitesCreatedBy", fields: [createdById], references: [id], onDelete: Cascade)
+
+  acceptedAt   DateTime?
+  acceptedById String?
+  acceptedBy   User?     @relation("inviteAcceptedBy", fields: [acceptedById], references: [id], onDelete: SetNull)
+
+  @@index([email])
+  @@index([expiresAt])
+  @@index([status])
+  @@index([createdAt])
+}
+
+/**
+ * ─────────────────────────────
+ * Badges (display-only)
+ * ─────────────────────────────
+ */
+
+model Badge {
+  id          String  @id @default(cuid())
+  key         String  @unique // e.g. "founder", "writer", "early_supporter"
+  label       String // display label
+  description String?
+  icon        String? // icon name or url
+  color       String? // token/key (not hard color if you prefer)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users UserBadge[]
+}
+
+model UserBadge {
+  userId  String
+  badgeId String
+
+  assignedAt DateTime @default(now())
+  assignedBy String? // admin userId (optional)
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  badge Badge @relation(fields: [badgeId], references: [id], onDelete: Cascade)
+
+  @@id([userId, badgeId])
+  @@index([badgeId])
+  @@index([assignedAt])
+}
+
+/**
+ * ─────────────────────────────
+ * Audit Log (Enterprise)
+ * ─────────────────────────────
+ */
+
+model AuditLog {
+  id String @id @default(cuid())
+
+  severity AuditSeverity @default(INFO)
+  action   AuditAction
+
+  // who did it
+  actorId String?
+  actor   User?   @relation("auditActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  // who was affected (optional)
+  targetUserId String?
+  targetUser   User?   @relation("auditTarget", fields: [targetUserId], references: [id], onDelete: SetNull)
+
+  // request correlation (enterprise observability)
+  requestId String?
+  traceId   String?
+
+  // resource correlation (optional)
+  resourceType String?
+  resourceId   String?
+
+  // context
+  ip        String?
+  userAgent String?
+  meta      Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([action])
+  @@index([severity])
+  @@index([actorId])
+  @@index([targetUserId])
+  @@index([createdAt])
+  @@index([requestId])
+  @@index([traceId])
+}
