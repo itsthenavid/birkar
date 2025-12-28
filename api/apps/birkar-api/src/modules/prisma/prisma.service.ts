@@ -16,12 +16,14 @@ export class PrismaService
   extends PrismaClient
   implements OnModuleInit, OnModuleDestroy
 {
-  private readonly pool: PoolType;
+  private pool?: PoolType;
 
   constructor() {
-    const url = requireEnv('DATABASE_URL');
+    const url = process.env.DATABASE_URL?.trim();
 
-    const pool = new Pool({ connectionString: url });
+    const finalUrl = url && url.length > 0 ? url : requireEnv('DATABASE_URL');
+
+    const pool = new Pool({ connectionString: finalUrl });
     const adapter = new PrismaPg(pool);
 
     super({ adapter });
@@ -35,6 +37,6 @@ export class PrismaService
 
   async onModuleDestroy(): Promise<void> {
     await this.$disconnect();
-    await this.pool.end();
+    await this.pool?.end();
   }
 }

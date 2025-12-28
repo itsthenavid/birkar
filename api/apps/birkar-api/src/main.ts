@@ -1,35 +1,39 @@
-import 'dotenv/config';
+import { Module } from '@nestjs/common';
+import { ThrottlerModule, seconds } from '@nestjs/throttler';
 
-import { NestFactory } from '@nestjs/core';
-import type { NestExpressApplication } from '@nestjs/platform-express';
-import cookieParser from 'cookie-parser';
-import helmet from 'helmet';
+import { AppController } from './app.controller';
 
-import { AppModule } from './app.module';
-import { csrfMiddleware } from './common/security/csrf.middleware';
-import { CsrfService } from './common/security/csrf.service';
+import { PrismaModule } from './modules/prisma/prisma.module';
+import { RedisModule } from './modules/redis/redis.module';
 
-async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+import { AuthModule } from './modules/auth/auth.modules';
 
-  app.set('trust proxy', 1);
+import { AuditModule } from './common/audit/audit.module';
+import { LockoutService } from './common/security/lockout.service';
+import { RedisThrottlerStorage } from './common/security/throttle/redis-throttler.storage';
+import { RedisService } from './modules/redis/redis.service';
 
-  app.use(helmet());
+@Module({
+  imports: [
+    PrismaModule,
+    RedisModule,
+    AuditModule,
 
-  app.use(cookieParser(process.env.COOKIE_SECRET ?? 'dev_only_change_me'));
+    // Global throttling (distributed via Redis)
+    ThrottlerModule.forRootAsync({
+      inject: [RedisService],
+      useFactory: (redisSvc: RedisService) => ({
+        throttlers: [
+          // global sane defaults
+          { name: 'global', ttl: seconds(60), limit: 120 },
+        ],
+        storage: new RedisThrottlerStorage(redisSvc.redis),
+      }),
+    }),
 
-  const csrf = app.get(CsrfService);
-  app.use(csrfMiddleware(csrf));
-
-  app.enableCors({
-    origin: process.env.CORS_ORIGIN ?? 'http://localhost:3000',
-    credentials: true,
-  });
-
-  const port = Number(process.env.PORT ?? 3001);
-  await app.listen(port);
-
-  console.log(`🚀 API listening on http://localhost:${port}`);
-}
-
-void bootstrap();
+    AuthModule,
+  ],
+  controllers: [AppController],
+  providers: [LockoutService],
+})
+export class AppModule {}

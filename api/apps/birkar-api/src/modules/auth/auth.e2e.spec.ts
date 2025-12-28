@@ -1,41 +1,37 @@
+// src/modules/auth/auth.e2e.spec.ts
 import 'dotenv/config';
-process.env.NODE_ENV = 'development';
 
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import type { Server } from 'http';
 import request from 'supertest';
 
+import {
+  expectCookiePair,
+  readSetCookieHeader,
+  type HeadersLike,
+} from '../../../test/utils/http-cookies';
+import { getServer } from '../../../test/utils/supertest';
 import { AppModule } from '../../app.module';
-
-function asCookieArray(v: unknown): string[] {
-  if (Array.isArray(v) && v.every((x) => typeof x === 'string')) return v;
-  if (typeof v === 'string') return [v];
-  return [];
-}
-
-function extractCookie(setCookieHeader: unknown, name: string): string | null {
-  const rows = asCookieArray(setCookieHeader);
-  const row = rows.find((c) => c.startsWith(`${name}=`));
-  if (!row) return null;
-  return row.split(';')[0]; // "name=value"
-}
 
 type OkBody = { ok: boolean; user?: { id: string } };
 
+function asHeadersLike(input: unknown): HeadersLike {
+  if (typeof input !== 'object' || input === null) return {};
+  return input as HeadersLike;
+}
+
 describe('Auth v1 (e2e-ish)', () => {
   let app: INestApplication;
-  let server: Server;
 
   beforeAll(async () => {
+    process.env.NODE_ENV = 'development';
+
     const mod = await Test.createTestingModule({
       imports: [AppModule],
     }).compile();
 
     app = mod.createNestApplication();
     await app.init();
-
-    server = app.getHttpServer() as Server;
   });
 
   afterAll(async () => {
@@ -46,7 +42,7 @@ describe('Auth v1 (e2e-ish)', () => {
     const username = `u_${Date.now()}`;
     const email = `${username}@test.local`;
 
-    const res = await request(server)
+    const res = await request(getServer(app))
       .post('/auth/register')
       .set('x-csrf-token', 'dummy')
       .set('Cookie', ['csrf=dummy'])
@@ -56,11 +52,8 @@ describe('Auth v1 (e2e-ish)', () => {
     const body = res.body as OkBody;
     expect(body.ok).toBe(true);
 
-    const sid = extractCookie(
-      res.headers['set-cookie'],
-      process.env.SESSION_COOKIE_NAME ?? 'sid',
-    );
-    expect(sid).toBeTruthy();
+    const setCookie = readSetCookieHeader(asHeadersLike(res.headers));
+    expectCookiePair(setCookie, process.env.SESSION_COOKIE_NAME ?? 'sid');
   });
 
   it('login -> sets session cookie, me works', async () => {
@@ -69,22 +62,22 @@ describe('Auth v1 (e2e-ish)', () => {
     const password =
       process.env.SEED_SUPERUSER_PASSWORD ?? 'ChangeMe_DevOnly_123!';
 
-    const loginRes = await request(server)
+    const loginRes = await request(getServer(app))
       .post('/auth/login')
       .set('x-csrf-token', 'dummy')
       .set('Cookie', ['csrf=dummy'])
       .send({ identifier, password })
       .expect(201);
 
-    const sidCookie = extractCookie(
-      loginRes.headers['set-cookie'],
+    const setCookie = readSetCookieHeader(asHeadersLike(loginRes.headers));
+    const sidCookie = expectCookiePair(
+      setCookie,
       process.env.SESSION_COOKIE_NAME ?? 'sid',
     );
-    expect(sidCookie).toBeTruthy();
 
-    const meRes = await request(server)
+    const meRes = await request(getServer(app))
       .get('/auth/me')
-      .set('Cookie', [sidCookie!])
+      .set('Cookie', [sidCookie])
       .expect(200);
 
     const meBody = meRes.body as OkBody;
@@ -98,28 +91,28 @@ describe('Auth v1 (e2e-ish)', () => {
     const password =
       process.env.SEED_SUPERUSER_PASSWORD ?? 'ChangeMe_DevOnly_123!';
 
-    const loginRes = await request(server)
+    const loginRes = await request(getServer(app))
       .post('/auth/login')
       .set('x-csrf-token', 'dummy')
       .set('Cookie', ['csrf=dummy'])
       .send({ identifier, password })
       .expect(201);
 
-    const sidCookie = extractCookie(
-      loginRes.headers['set-cookie'],
+    const setCookie = readSetCookieHeader(asHeadersLike(loginRes.headers));
+    const sidCookie = expectCookiePair(
+      setCookie,
       process.env.SESSION_COOKIE_NAME ?? 'sid',
     );
-    expect(sidCookie).toBeTruthy();
 
-    await request(server)
+    await request(getServer(app))
       .post('/auth/logout')
       .set('x-csrf-token', 'dummy')
-      .set('Cookie', ['csrf=dummy', sidCookie!])
+      .set('Cookie', ['csrf=dummy', sidCookie])
       .expect(201);
 
-    await request(server)
+    await request(getServer(app))
       .get('/auth/me')
-      .set('Cookie', [sidCookie!])
+      .set('Cookie', [sidCookie])
       .expect(401);
   });
 });

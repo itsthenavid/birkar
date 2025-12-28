@@ -4,12 +4,13 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+  // url      = env("DATABASE_URL") // if you already have it elsewhere keep your current style
 }
 
 /**
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  * Enums
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  */
 
 enum UserStatus {
@@ -18,12 +19,22 @@ enum UserStatus {
   DELETED
 }
 
+/**
+ * Auth token purposes.
+ * NOTE: purpose is the only enum you truly need; "status" can be derived
+ * from usedAt/revokedAt/expiresAt. Kept as-is because you already have it,
+ * but we align it with timestamps and indexes.
+ */
 enum TokenPurpose {
   VERIFY_EMAIL
   RESET_PASSWORD
   CHANGE_EMAIL
 }
 
+/**
+ * TokenStatus is mostly derivable. If you keep it, you must enforce
+ * consistency at write time (service sets ACTIVE/USED/REVOKED and can set EXPIRED via job).
+ */
 enum TokenStatus {
   ACTIVE
   USED
@@ -78,9 +89,9 @@ enum AuditAction {
 }
 
 /**
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  * Base: Users / Profiles
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  */
 
 model User {
@@ -97,10 +108,9 @@ model User {
   avatarUrl String?
   bio       String?
 
-  // timestamps
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
-  deletedAt DateTime? // soft delete for safety/audit
+  deletedAt DateTime? // soft delete for safety/audit (status may become DELETED too)
 
   // relations
   profile Profile?
@@ -129,6 +139,9 @@ model User {
   @@index([deletedAt])
 }
 
+/**
+ * Public profile is separated for future i18n/user-settings expansions.
+ */
 model Profile {
   id     String @id @default(cuid())
   userId String @unique
@@ -145,9 +158,9 @@ model Profile {
 }
 
 /**
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  * Social: Follow
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  */
 
 model Follow {
@@ -165,9 +178,9 @@ model Follow {
 }
 
 /**
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  * RBAC (Role/Permission)
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  */
 
 model Role {
@@ -212,7 +225,7 @@ model UserRole {
   role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
 
   assignedAt DateTime @default(now())
-  assignedBy String? // optional: admin userId for audit, keep string to avoid circular strictness
+  assignedBy String? // optional: admin userId for audit
 
   @@id([userId, roleId])
   @@index([roleId])
@@ -220,9 +233,9 @@ model UserRole {
 }
 
 /**
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  * Auth: Sessions (DB sessions + metadata)
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  */
 
 model Session {
@@ -258,9 +271,9 @@ model Session {
 }
 
 /**
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  * Auth: OAuth Accounts
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  */
 
 model OAuthAccount {
@@ -269,7 +282,7 @@ model OAuthAccount {
 
   provider   String // "google" (future: github, apple, ...)
   providerId String // provider user id (sub)
-  email      String? @db.Citext // provider email (optional but useful)
+  email      String? @db.Citext
 
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
@@ -284,9 +297,14 @@ model OAuthAccount {
 }
 
 /**
- * ─────────────────────────────
- * Auth: Tokens (verify/reset/change email)
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
+ * Auth: Tokens (verify/reset/change-email)
+ * ────────────────────────────────────────────────────────────────
+ * Professional notes:
+ * - tokenHash is stored (SHA-256) and unique.
+ * - status is optional/derivable; but kept because you already use it.
+ * - usedAt/revokedAt are the source of truth.
+ * - session binding is optional (useful for "change-email" confirm from same session).
  */
 
 model AuthToken {
@@ -303,7 +321,7 @@ model AuthToken {
   usedAt    DateTime?
   revokedAt DateTime?
 
-  // bind to a session optionally (security)
+  // optional bind to a session (security)
   sessionId String?
   session   Session? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
 
@@ -314,16 +332,16 @@ model AuthToken {
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId, purpose])
+  @@index([userId, purpose, createdAt])
   @@index([expiresAt])
   @@index([status])
   @@index([sessionId])
 }
 
 /**
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  * Writer Access Gating
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  */
 
 model WriterAccessRequest {
@@ -374,18 +392,18 @@ model WriterInvite {
 }
 
 /**
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  * Badges (display-only)
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  */
 
 model Badge {
   id          String  @id @default(cuid())
-  key         String  @unique // e.g. "founder", "writer", "early_supporter"
-  label       String // display label
+  key         String  @unique
+  label       String
   description String?
-  icon        String? // icon name or url
-  color       String? // token/key (not hard color if you prefer)
+  icon        String?
+  color       String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -398,7 +416,7 @@ model UserBadge {
   badgeId String
 
   assignedAt DateTime @default(now())
-  assignedBy String? // admin userId (optional)
+  assignedBy String?
 
   user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
   badge Badge @relation(fields: [badgeId], references: [id], onDelete: Cascade)
@@ -409,9 +427,9 @@ model UserBadge {
 }
 
 /**
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  * Audit Log (Enterprise)
- * ─────────────────────────────
+ * ────────────────────────────────────────────────────────────────
  */
 
 model AuditLog {
@@ -420,23 +438,18 @@ model AuditLog {
   severity AuditSeverity @default(INFO)
   action   AuditAction
 
-  // who did it
   actorId String?
   actor   User?   @relation("auditActor", fields: [actorId], references: [id], onDelete: SetNull)
 
-  // who was affected (optional)
   targetUserId String?
   targetUser   User?   @relation("auditTarget", fields: [targetUserId], references: [id], onDelete: SetNull)
 
-  // request correlation (enterprise observability)
   requestId String?
   traceId   String?
 
-  // resource correlation (optional)
   resourceType String?
   resourceId   String?
 
-  // context
   ip        String?
   userAgent String?
   meta      Json?

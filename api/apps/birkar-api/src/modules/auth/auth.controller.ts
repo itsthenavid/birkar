@@ -1,7 +1,9 @@
+// src/modules/auth/auth.controller.ts
 import {
   Body,
   Controller,
   Get,
+  HttpCode,
   Post,
   Req,
   Res,
@@ -10,6 +12,7 @@ import {
 import type { Request, Response } from 'express';
 
 import { ENV } from '../../common/constants/env.constants';
+import { readHeaderString, resolveIp } from '../../common/http/headers';
 import { AuthRateLimitGuard } from '../../common/security/rate-limit.guard';
 import { buildSessionCookieOptions } from '../../common/utils/cookies';
 
@@ -17,6 +20,12 @@ import { SessionGuard } from '../sessions/session.guard';
 import { SessionsService } from '../sessions/session.service';
 
 import { AuthService } from './auth.service';
+import {
+  PasswordResetConfirmSchema,
+  PasswordResetRequestSchema,
+  VerifyEmailConfirmSchema,
+  VerifyEmailRequestSchema,
+} from './dto/auth-tokens.dto';
 import { LoginSchema } from './dto/login.dto';
 import { RegisterSchema } from './dto/register.dto';
 
@@ -44,8 +53,8 @@ export class AuthController {
     const user = await this.auth.register(dto);
 
     const created = await this.sessions.createSession(user.id, {
-      ip: req.socket.remoteAddress ?? undefined,
-      userAgent: req.headers['user-agent'],
+      ip: resolveIp(req),
+      userAgent: readHeaderString(req, 'user-agent'),
     });
 
     const cookieName = process.env[ENV.SESSION_COOKIE_NAME] ?? 'sid';
@@ -62,17 +71,21 @@ export class AuthController {
   ) {
     const dto = LoginSchema.parse(body);
 
-    const user = await this.auth.validateLocal(dto.identifier, dto.password);
+    const ip = resolveIp(req);
+    const userAgent = readHeaderString(req, 'user-agent');
 
-    const meta = {
-      ip: req.socket.remoteAddress ?? undefined,
-      userAgent: req.headers['user-agent'],
-    };
+    const user = await this.auth.validateLocal(dto.identifier, dto.password, {
+      ip,
+      userAgent,
+    });
 
     const created =
       dto.rotate && req.session?.id
-        ? await this.sessions.rotateSession(req.session.id, user.id, meta)
-        : await this.sessions.createSession(user.id, meta);
+        ? await this.sessions.rotateSession(req.session.id, user.id, {
+            ip,
+            userAgent,
+          })
+        : await this.sessions.createSession(user.id, { ip, userAgent });
 
     const cookieName = process.env[ENV.SESSION_COOKIE_NAME] ?? 'sid';
     res.cookie(cookieName, created.token, buildSessionCookieOptions());
@@ -102,5 +115,74 @@ export class AuthController {
     const userId = req.user!.id;
     const user = await this.auth.me(userId);
     return { ok: true, user };
+  }
+
+  // ──────────────────────────────
+  // Verify Email
+  // ──────────────────────────────
+
+  @Post('/verify-email/request')
+  @UseGuards(SessionGuard)
+  async requestVerifyEmail(@Body() body: unknown, @Req() req: AuthedRequest) {
+    const dto = VerifyEmailRequestSchema.parse(body);
+
+    const out = await this.auth.requestVerifyEmail({
+      userId: req.user!.id,
+      email: dto.email,
+      meta: {
+        ip: resolveIp(req),
+        userAgent: readHeaderString(req, 'user-agent'),
+      },
+    });
+
+    return { ok: true, ...out };
+  }
+
+  @Post('/verify-email/confirm')
+  @HttpCode(204)
+  async confirmVerifyEmail(@Body() body: unknown, @Req() req: Request) {
+    const dto = VerifyEmailConfirmSchema.parse(body);
+
+    await this.auth.confirmVerifyEmail({
+      token: dto.token,
+      meta: {
+        ip: resolveIp(req),
+        userAgent: readHeaderString(req, 'user-agent'),
+      },
+    });
+  }
+
+  // ──────────────────────────────
+  // Password Reset
+  // ──────────────────────────────
+
+  @Post('/password/reset/request')
+  async requestPasswordReset(@Body() body: unknown, @Req() req: Request) {
+    const dto = PasswordResetRequestSchema.parse(body);
+
+    const out = await this.auth.requestPasswordReset({
+      identifier: dto.identifier,
+      meta: {
+        ip: resolveIp(req),
+        userAgent: readHeaderString(req, 'user-agent'),
+      },
+    });
+
+    return { ok: true, ...out };
+  }
+
+  @Post('/password/reset/confirm')
+  @HttpCode(204)
+  async confirmPasswordReset(@Body() body: unknown, @Req() req: Request) {
+    const dto = PasswordResetConfirmSchema.parse(body);
+
+    await this.auth.confirmPasswordReset({
+      token: dto.token,
+      newPassword: dto.newPassword,
+      meta: {
+        ip: resolveIp(req),
+        userAgent: readHeaderString(req, 'user-agent'),
+      },
+    });
   }
 }
