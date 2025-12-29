@@ -1,10 +1,10 @@
 // src/common/security/csrf/csrf.middleware.ts
 import type { NextFunction, Request, Response } from 'express';
 
-import { readHeaderString } from '../http/headers';
-import { buildCsrfCookieOptions } from '../utils/cookies';
-import type { CsrfService } from './csrf.service';
-import { csrfCookieName, csrfHeaderName } from './csrf/csrf.constants';
+import { readHeaderString } from '../../http/headers';
+import { buildCsrfCookieOptions } from '../../utils/cookies';
+import type { CsrfService } from '../csrf.service';
+import { csrfCookieName, csrfHeaderName } from './csrf.constants';
 
 type CookieBag = Record<string, unknown>;
 
@@ -12,6 +12,7 @@ function readCookie(req: Request, name: string): string | undefined {
   const cookiesUnknown = (req as unknown as { cookies?: unknown }).cookies;
   if (typeof cookiesUnknown !== 'object' || cookiesUnknown === null)
     return undefined;
+
   const bag = cookiesUnknown as CookieBag;
   const v = bag[name];
   return typeof v === 'string' ? v : undefined;

@@ -3,6 +3,7 @@ import 'dotenv/config';
 
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import { randomUUID } from 'crypto';
 import request from 'supertest';
 
 import {
@@ -26,14 +27,34 @@ function asHeadersLike(input: unknown): HeadersLike {
   return input as HeadersLike;
 }
 
+/**
+ * username constraint: <= 32 chars (per Zod)
+ * We generate a short suffix from UUID.
+ */
+function shortId(len: number): string {
+  const raw = randomUUID().replace(/-/g, ''); // 32 hex chars
+  return raw.slice(0, Math.max(1, Math.min(len, raw.length)));
+}
+
+function makeUsername(prefix = 'u'): string {
+  // keep well under 32, safe: "u_" + 18 = 20 chars
+  return `${prefix}_${shortId(18)}`;
+}
+
+function makeEmail(username: string, domain = 'example.com'): string {
+  return `${username}@${domain}`;
+}
+
 function extractToken(bodyUnknown: unknown): string {
   const body = asBodyLike(bodyUnknown);
   const token = body['token'];
-  if (typeof token !== 'string' || token.length === 0) {
+
+  if (typeof token !== 'string' || token.trim().length === 0) {
     throw new Error(
       `Expected token string in body, got: ${JSON.stringify(body)}`,
     );
   }
+
   return token;
 }
 
@@ -62,6 +83,7 @@ describe('Auth v1 (tokens) (e2e-ish)', () => {
 
   beforeAll(async () => {
     process.env.NODE_ENV = 'test';
+    process.env.SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME ?? 'sid';
 
     const mod = await Test.createTestingModule({
       imports: [AppModule],
@@ -76,8 +98,8 @@ describe('Auth v1 (tokens) (e2e-ish)', () => {
   });
 
   it('verify email: request + confirm -> me shows emailVerifiedAt', async () => {
-    const username = `u_${Date.now()}`;
-    const email = `${username}@example.com`;
+    const username = makeUsername('u');
+    const email = makeEmail(username);
     const password = 'StrongPass_123!';
 
     const reg = await request(getServer(app))
@@ -117,8 +139,8 @@ describe('Auth v1 (tokens) (e2e-ish)', () => {
   });
 
   it('password reset: request + confirm -> old password fails, new works, sessions invalidated', async () => {
-    const username = `u_${Date.now()}_pw`;
-    const email = `${username}@example.com`;
+    const username = makeUsername('u');
+    const email = makeEmail(username);
     const password = 'StrongPass_123!';
     const newPassword = 'NewStrongPass_456!';
 
@@ -132,6 +154,7 @@ describe('Auth v1 (tokens) (e2e-ish)', () => {
       readSetCookieHeader(headers),
     );
 
+    // sanity: session works before reset
     await request(getServer(app))
       .get('/auth/me')
       .set('Cookie', cookieHeader)
@@ -149,16 +172,19 @@ describe('Auth v1 (tokens) (e2e-ish)', () => {
       .send({ token, newPassword })
       .expect(204);
 
+    // old session should be invalid now
     await request(getServer(app))
       .get('/auth/me')
       .set('Cookie', cookieHeader)
       .expect(401);
 
+    // old password fails
     await request(getServer(app))
       .post('/auth/login')
       .send({ identifier: email, password })
       .expect(401);
 
+    // new password works
     const login2 = await request(getServer(app))
       .post('/auth/login')
       .send({ identifier: email, password: newPassword })

@@ -1,13 +1,12 @@
-// src/test/app.e2e-spec.ts
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 
-import { AppModule } from '../src/app.module';
-import { getServer } from './utils/supertest';
+import { AppModule } from '../../src/app.module';
+import { getServer } from '../utils/supertest';
 
 describe('AppController (e2e)', () => {
-  let app: INestApplication;
+  let app: INestApplication | undefined;
 
   beforeAll(async () => {
     const moduleFixture = await Test.createTestingModule({
@@ -19,10 +18,10 @@ describe('AppController (e2e)', () => {
   });
 
   afterAll(async () => {
-    await app.close();
+    if (app) await app.close();
   });
 
-  it('/ (GET)', async () => {
-    await request(getServer(app)).get('/').expect(200);
+  it('GET /health -> 200', async () => {
+    await request(getServer(app!)).get('/health').expect(200);
   });
 });

@@ -1,4 +1,3 @@
-// src/modules/auth/auth.controller.ts
 import {
   Body,
   Controller,
@@ -14,6 +13,7 @@ import type { Request, Response } from 'express';
 import { ENV } from '../../common/constants/env.constants';
 import { readHeaderString, resolveIp } from '../../common/http/headers';
 import { AuthRateLimitGuard } from '../../common/security/rate-limit.guard';
+import { TokenRateLimitGuard } from '../../common/security/token-rate-limit.guard';
 import { buildSessionCookieOptions } from '../../common/utils/cookies';
 
 import { SessionGuard } from '../sessions/session.guard';
@@ -29,18 +29,65 @@ import {
 import { LoginSchema } from './dto/login.dto';
 import { RegisterSchema } from './dto/register.dto';
 
+type RequestUser = { id: string };
+type RequestSession = { id: string };
+
 type AuthedRequest = Request & {
-  user?: { id: string };
-  session?: { id: string };
+  user?: RequestUser;
+  session?: RequestSession;
 };
 
+type AuthMeta = { ip?: string; userAgent?: string };
+
 @Controller('/auth')
-@UseGuards(AuthRateLimitGuard)
+@UseGuards(AuthRateLimitGuard) // coarse baseline auth throttling
 export class AuthController {
   constructor(
     private readonly auth: AuthService,
     private readonly sessions: SessionsService,
   ) {}
+
+  // ──────────────────────────────
+  // Helpers
+  // ──────────────────────────────
+
+  private get sessionCookieName(): string {
+    return process.env[ENV.SESSION_COOKIE_NAME] ?? 'sid';
+  }
+
+  private isTestEnv(): boolean {
+    return (process.env.NODE_ENV ?? '').toLowerCase() === 'test';
+  }
+
+  private setSessionCookie(res: Response, token: string): void {
+    res.cookie(this.sessionCookieName, token, buildSessionCookieOptions());
+  }
+
+  private clearSessionCookie(res: Response): void {
+    res.clearCookie(this.sessionCookieName, buildSessionCookieOptions());
+  }
+
+  private metaFromReq(req: Request): AuthMeta {
+    return {
+      ip: resolveIp(req),
+      userAgent: readHeaderString(req, 'user-agent'),
+    };
+  }
+
+  private requireUser(req: AuthedRequest): RequestUser {
+    // SessionGuard should set this; this is a safety net for type narrowing.
+    if (!req.user?.id) {
+      // We intentionally do NOT leak details; SessionGuard should already have 401’d.
+      throw new Error(
+        'Invariant violated: authenticated user missing on request',
+      );
+    }
+    return req.user;
+  }
+
+  // ──────────────────────────────
+  // Register / Login / Logout / Me
+  // ──────────────────────────────
 
   @Post('/register')
   async register(
@@ -52,14 +99,12 @@ export class AuthController {
 
     const user = await this.auth.register(dto);
 
-    const created = await this.sessions.createSession(user.id, {
-      ip: resolveIp(req),
-      userAgent: readHeaderString(req, 'user-agent'),
-    });
+    const created = await this.sessions.createSession(
+      user.id,
+      this.metaFromReq(req),
+    );
 
-    const cookieName = process.env[ENV.SESSION_COOKIE_NAME] ?? 'sid';
-    res.cookie(cookieName, created.token, buildSessionCookieOptions());
-
+    this.setSessionCookie(res, created.token);
     return { ok: true, user };
   }
 
@@ -70,26 +115,23 @@ export class AuthController {
     @Res({ passthrough: true }) res: Response,
   ) {
     const dto = LoginSchema.parse(body);
+    const meta = this.metaFromReq(req);
 
-    const ip = resolveIp(req);
-    const userAgent = readHeaderString(req, 'user-agent');
+    const user = await this.auth.validateLocal(
+      dto.identifier,
+      dto.password,
+      meta,
+    );
 
-    const user = await this.auth.validateLocal(dto.identifier, dto.password, {
-      ip,
-      userAgent,
-    });
-
+    // Session rotation policy:
+    // - if client asks for rotate AND a session exists, rotate it
+    // - otherwise create a fresh session
     const created =
       dto.rotate && req.session?.id
-        ? await this.sessions.rotateSession(req.session.id, user.id, {
-            ip,
-            userAgent,
-          })
-        : await this.sessions.createSession(user.id, { ip, userAgent });
+        ? await this.sessions.rotateSession(req.session.id, user.id, meta)
+        : await this.sessions.createSession(user.id, meta);
 
-    const cookieName = process.env[ENV.SESSION_COOKIE_NAME] ?? 'sid';
-    res.cookie(cookieName, created.token, buildSessionCookieOptions());
-
+    this.setSessionCookie(res, created.token);
     return { ok: true };
   }
 
@@ -99,20 +141,18 @@ export class AuthController {
     @Req() req: AuthedRequest,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const cookieName = process.env[ENV.SESSION_COOKIE_NAME] ?? 'sid';
-
     if (req.session?.id) {
       await this.sessions.revokeById(req.session.id);
     }
 
-    res.clearCookie(cookieName, buildSessionCookieOptions());
+    this.clearSessionCookie(res);
     return { ok: true };
   }
 
   @Get('/me')
   @UseGuards(SessionGuard)
   async me(@Req() req: AuthedRequest) {
-    const userId = req.user!.id;
+    const userId = this.requireUser(req).id;
     const user = await this.auth.me(userId);
     return { ok: true, user };
   }
@@ -121,34 +161,41 @@ export class AuthController {
   // Verify Email
   // ──────────────────────────────
 
+  /**
+   * Requires session:
+   * - avoids account enumeration
+   * - allows keying by userId in TokenRateLimitGuard
+   *
+   * Privacy policy:
+   * - In production: do NOT return token-like material
+   * - In test: return token for e2e determinism
+   */
   @Post('/verify-email/request')
-  @UseGuards(SessionGuard)
+  @UseGuards(SessionGuard, TokenRateLimitGuard)
   async requestVerifyEmail(@Body() body: unknown, @Req() req: AuthedRequest) {
     const dto = VerifyEmailRequestSchema.parse(body);
 
     const out = await this.auth.requestVerifyEmail({
-      userId: req.user!.id,
+      userId: this.requireUser(req).id,
       email: dto.email,
-      meta: {
-        ip: resolveIp(req),
-        userAgent: readHeaderString(req, 'user-agent'),
-      },
+      meta: this.metaFromReq(req),
     });
 
-    return { ok: true, ...out };
+    return this.isTestEnv() ? { ok: true, ...out } : { ok: true };
   }
 
+  /**
+   * Optional but recommended: rate-limit confirm too (brute-force token attempts)
+   */
   @Post('/verify-email/confirm')
+  @UseGuards(TokenRateLimitGuard)
   @HttpCode(204)
   async confirmVerifyEmail(@Body() body: unknown, @Req() req: Request) {
     const dto = VerifyEmailConfirmSchema.parse(body);
 
     await this.auth.confirmVerifyEmail({
       token: dto.token,
-      meta: {
-        ip: resolveIp(req),
-        userAgent: readHeaderString(req, 'user-agent'),
-      },
+      meta: this.metaFromReq(req),
     });
   }
 
@@ -156,22 +203,32 @@ export class AuthController {
   // Password Reset
   // ──────────────────────────────
 
+  /**
+   * Public endpoint (no session), must be privacy-safe.
+   * TokenRateLimitGuard will key using ip + identifierHash.
+   *
+   * Privacy policy:
+   * - In production: always return {ok:true} (no enumeration)
+   * - In test: return token for e2e determinism
+   */
   @Post('/password/reset/request')
+  @UseGuards(TokenRateLimitGuard)
   async requestPasswordReset(@Body() body: unknown, @Req() req: Request) {
     const dto = PasswordResetRequestSchema.parse(body);
 
     const out = await this.auth.requestPasswordReset({
       identifier: dto.identifier,
-      meta: {
-        ip: resolveIp(req),
-        userAgent: readHeaderString(req, 'user-agent'),
-      },
+      meta: this.metaFromReq(req),
     });
 
-    return { ok: true, ...out };
+    return this.isTestEnv() ? { ok: true, ...out } : { ok: true };
   }
 
+  /**
+   * Optional but recommended: rate-limit confirm too (brute-force token attempts)
+   */
   @Post('/password/reset/confirm')
+  @UseGuards(TokenRateLimitGuard)
   @HttpCode(204)
   async confirmPasswordReset(@Body() body: unknown, @Req() req: Request) {
     const dto = PasswordResetConfirmSchema.parse(body);
@@ -179,10 +236,7 @@ export class AuthController {
     await this.auth.confirmPasswordReset({
       token: dto.token,
       newPassword: dto.newPassword,
-      meta: {
-        ip: resolveIp(req),
-        userAgent: readHeaderString(req, 'user-agent'),
-      },
+      meta: this.metaFromReq(req),
     });
   }
 }

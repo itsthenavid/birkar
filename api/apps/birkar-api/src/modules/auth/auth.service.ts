@@ -24,11 +24,10 @@ import {
 
 type AuthMeta = { ip?: string; userAgent?: string };
 
-// ----------------------------
+// ──────────────────────────────
 // TokenPurpose resolver (runtime-safe)
-// ----------------------------
+// ──────────────────────────────
 function pickTokenPurpose(...keys: string[]): TokenPurpose {
-  // Prisma enums are runtime objects. But TS typing might not expose index signature.
   const enumObj = TokenPurpose as unknown as Record<
     string,
     TokenPurpose | undefined
@@ -46,8 +45,7 @@ function pickTokenPurpose(...keys: string[]): TokenPurpose {
   );
 }
 
-// Resolve your project-specific names here.
-// These will work even if your enum uses different naming.
+// Resolve project-specific names (robust even if enum names differ)
 const PURPOSE_EMAIL_VERIFY: TokenPurpose = pickTokenPurpose(
   'EMAIL_VERIFY',
   'VERIFY_EMAIL',
@@ -64,6 +62,29 @@ const PURPOSE_PASSWORD_RESET: TokenPurpose = pickTokenPurpose(
   'RESET_PASSWORD_REQUEST',
 );
 
+// ──────────────────────────────
+// Small utilities
+// ──────────────────────────────
+function isTestEnv(): boolean {
+  return (process.env.NODE_ENV ?? '').toLowerCase() === 'test';
+}
+
+function now(): Date {
+  return new Date();
+}
+
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+
+function clamp(n: number, min: number, max: number): number {
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
 @Injectable()
 export class AuthService {
   constructor(
@@ -72,14 +93,45 @@ export class AuthService {
     private readonly lockout: LockoutService,
   ) {}
 
-  // ----------------------------
+  // ──────────────────────────────
+  // Password hashing
+  // ──────────────────────────────
+
+  private async hashPassword(password: string): Promise<string> {
+    // Reasonable secure defaults; keep adjustable via ENV for CI/low-memory envs
+    const timeCost = clamp(envInt('ARGON2_TIME_COST', 3), 1, 10);
+    const memoryCost = clamp(
+      envInt('ARGON2_MEMORY_COST_KIB', 64 * 1024),
+      8 * 1024,
+      512 * 1024,
+    ); // 8MiB..512MiB
+    const parallelism = clamp(envInt('ARGON2_PARALLELISM', 1), 1, 8);
+
+    return argon2.hash(password, {
+      type: argon2.argon2id,
+      timeCost,
+      memoryCost,
+      parallelism,
+    });
+  }
+
+  private async verifyPassword(
+    hash: string,
+    password: string,
+  ): Promise<boolean> {
+    // argon2.verify is timing-safe for the hash compare internally
+    return argon2.verify(hash, password);
+  }
+
+  // ──────────────────────────────
   // Register / Login / Me
-  // ----------------------------
+  // ──────────────────────────────
 
   async register(input: { username: string; email: string; password: string }) {
     const email = normalizeEmail(input.email);
     const username = normalizeUsername(input.username);
 
+    // Pre-check for nice UX (Prisma unique filter is global anyway)
     const exists = await this.prisma.user.findFirst({
       where: { OR: [{ email }, { username }] },
       select: { id: true },
@@ -88,9 +140,7 @@ export class AuthService {
       throw new BadRequestException('Username or email already exists');
     }
 
-    const passwordHash = await argon2.hash(input.password, {
-      type: argon2.argon2id,
-    });
+    const passwordHash = await this.hashPassword(input.password);
 
     const user = await this.prisma.user.create({
       data: {
@@ -103,6 +153,7 @@ export class AuthService {
       select: { id: true, email: true, username: true },
     });
 
+    // Best-effort role attach (don’t fail registration if roles table not seeded)
     const role = await this.prisma.role.findUnique({
       where: { name: 'USER' },
       select: { id: true },
@@ -129,7 +180,6 @@ export class AuthService {
   async validateLocal(identifier: string, password: string, meta?: AuthMeta) {
     const normalized = identifier.trim().toLowerCase();
     const ip = meta?.ip;
-
     const LOCK_PREFIX = 'login';
 
     const block = await this.lockout.check(LOCK_PREFIX, normalized, ip);
@@ -142,6 +192,7 @@ export class AuthService {
         userAgent: meta?.userAgent ?? null,
         meta: { result: 'blocked', retryAfterSec: block.retryAfterSec },
       });
+      // don’t reveal lockout
       throw new UnauthorizedException('Invalid credentials');
     }
 
@@ -158,7 +209,7 @@ export class AuthService {
       await this.audit.log({
         severity: 'SECURITY',
         action: 'AUTH_LOGIN',
-        actorId: null,
+        actorId: user?.id ?? null,
         ip: ip ?? null,
         userAgent: meta?.userAgent ?? null,
         meta: { result: 'failed', locked: s.blocked },
@@ -167,7 +218,7 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    const ok = await argon2.verify(user.passwordHash, password);
+    const ok = await this.verifyPassword(user.passwordHash, password);
     if (!ok) {
       const s = await this.lockout.onFailure(LOCK_PREFIX, normalized, ip);
 
@@ -218,18 +269,27 @@ export class AuthService {
     });
   }
 
-  // ----------------------------
+  // ──────────────────────────────
   // Token flows: verify email / reset password
-  // ----------------------------
+  // ──────────────────────────────
 
   private tokenTtlSeconds(purpose: TokenPurpose): number {
-    if (purpose === PURPOSE_EMAIL_VERIFY) return 60 * 60; // 1 hour
-    if (purpose === PURPOSE_PASSWORD_RESET) return 15 * 60; // 15 minutes
+    // Allow overrides via ENV for ops flexibility
+    if (purpose === PURPOSE_EMAIL_VERIFY) {
+      return clamp(
+        envInt('TOKEN_EMAIL_VERIFY_TTL_SEC', 60 * 60),
+        60,
+        7 * 24 * 3600,
+      );
+    }
+    if (purpose === PURPOSE_PASSWORD_RESET) {
+      return clamp(
+        envInt('TOKEN_PASSWORD_RESET_TTL_SEC', 15 * 60),
+        60,
+        24 * 3600,
+      );
+    }
     return 15 * 60;
-  }
-
-  private now(): Date {
-    return new Date();
   }
 
   private expiresAtFromNow(purpose: TokenPurpose): Date {
@@ -238,15 +298,16 @@ export class AuthService {
   }
 
   private async revokeExistingTokens(userId: string, purpose: TokenPurpose) {
+    // Enforces "max active tokens per user/purpose" == 1 (or effectively 0..1)
     await this.prisma.authToken.updateMany({
       where: {
         userId,
         purpose,
         usedAt: null,
         revokedAt: null,
-        expiresAt: { gt: this.now() },
+        expiresAt: { gt: now() },
       },
-      data: { revokedAt: this.now() },
+      data: { revokedAt: now() },
     });
   }
 
@@ -270,12 +331,7 @@ export class AuthService {
         purpose: input.purpose,
         tokenHash,
         expiresAt,
-
-        // Based on your schema errors: ip exists
         ip: input.meta?.ip ?? null,
-
-        // If later you add userAgent to schema, add it here.
-        // userAgent: input.meta?.userAgent ?? null,
       },
       select: { id: true },
     });
@@ -284,7 +340,11 @@ export class AuthService {
   }
 
   /**
-   * Consume token: validate hash match, not expired, not used/revoked, mark usedAt.
+   * Consume token:
+   * - Validate tokenHash exists
+   * - Ensure purpose matches
+   * - Ensure not expired / not used / not revoked
+   * - Mark usedAt (best-effort atomicity using conditional update)
    */
   private async consumeToken(input: {
     purpose: TokenPurpose;
@@ -304,7 +364,7 @@ export class AuthService {
       },
     });
 
-    // Do not reveal specifics
+    // Always generic error (no token oracle)
     if (
       !record ||
       record.purpose !== input.purpose ||
@@ -315,28 +375,35 @@ export class AuthService {
       throw new BadRequestException('Invalid token');
     }
 
-    await this.prisma.authToken.update({
-      where: { tokenHash },
-      data: {
-        usedAt: this.now(),
-
-        // Add consumed fields only if they exist in Prisma schema.
-        // consumedIp: input.meta?.ip ?? null,
-        // consumedUserAgent: input.meta?.userAgent ?? null,
+    // Conditional update reduces race (two requests using same token)
+    const updated = await this.prisma.authToken.updateMany({
+      where: {
+        tokenHash,
+        usedAt: null,
+        revokedAt: null,
+        expiresAt: { gt: now() },
+        purpose: input.purpose,
       },
-      select: { id: true },
+      data: { usedAt: now() },
     });
+
+    if (updated.count !== 1) {
+      throw new BadRequestException('Invalid token');
+    }
 
     return { userId: record.userId };
   }
 
-  // -------- Verify Email --------
+  // ──────────────────────────────
+  // Verify Email
+  // ──────────────────────────────
 
   async requestVerifyEmail(input: {
     userId?: string;
     email?: string;
     meta?: AuthMeta;
   }): Promise<{ token?: string }> {
+    // Prefer userId (session-based) to avoid enumeration
     let user: {
       id: string;
       emailVerifiedAt: Date | null;
@@ -358,7 +425,7 @@ export class AuthService {
       throw new BadRequestException('Email required');
     }
 
-    // privacy: if user not found or inactive, return ok
+    // privacy-safe NOOP
     if (!user || user.status !== 'ACTIVE') {
       await this.audit.log({
         severity: 'SECURITY',
@@ -371,7 +438,7 @@ export class AuthService {
       return {};
     }
 
-    // already verified: noop
+    // already verified => NOOP
     if (user.emailVerifiedAt) {
       await this.audit.log({
         severity: 'SECURITY',
@@ -384,7 +451,7 @@ export class AuthService {
       return {};
     }
 
-    const { rawToken } = await this.createAuthToken({
+    const { rawToken, expiresAt } = await this.createAuthToken({
       userId: user.id,
       purpose: PURPOSE_EMAIL_VERIFY,
       meta: input.meta,
@@ -396,13 +463,14 @@ export class AuthService {
       actorId: user.id,
       ip: input.meta?.ip ?? null,
       userAgent: input.meta?.userAgent ?? null,
-      meta: { result: 'ok' },
+      meta: {
+        result: 'ok',
+        purpose: String(PURPOSE_EMAIL_VERIFY),
+        expiresAt: expiresAt.toISOString(),
+      },
     });
 
-    if (process.env.NODE_ENV === 'test') {
-      return { token: rawToken };
-    }
-    return {};
+    return isTestEnv() ? { token: rawToken } : {};
   }
 
   async confirmVerifyEmail(input: {
@@ -417,22 +485,23 @@ export class AuthService {
 
     await this.prisma.user.update({
       where: { id: userId },
-      data: { emailVerifiedAt: this.now() },
+      data: { emailVerifiedAt: now() },
       select: { id: true },
     });
 
-    // Use an existing AuditAction to avoid type mismatch
     await this.audit.log({
       severity: 'SECURITY',
-      action: 'EMAIL_VERIFY_REQUESTED',
+      action: 'EMAIL_VERIFIED',
       actorId: userId,
       ip: input.meta?.ip ?? null,
       userAgent: input.meta?.userAgent ?? null,
-      meta: { result: 'confirmed' },
+      meta: { result: 'ok' },
     });
   }
 
-  // -------- Password Reset --------
+  // ──────────────────────────────
+  // Password Reset
+  // ──────────────────────────────
 
   async requestPasswordReset(input: {
     identifier: string;
@@ -447,7 +516,7 @@ export class AuthService {
       select: { id: true, status: true },
     });
 
-    // privacy: always ok
+    // privacy-safe NOOP
     if (!user || user.status !== 'ACTIVE') {
       await this.audit.log({
         severity: 'SECURITY',
@@ -460,7 +529,7 @@ export class AuthService {
       return {};
     }
 
-    const { rawToken } = await this.createAuthToken({
+    const { rawToken, expiresAt } = await this.createAuthToken({
       userId: user.id,
       purpose: PURPOSE_PASSWORD_RESET,
       meta: input.meta,
@@ -472,13 +541,14 @@ export class AuthService {
       actorId: user.id,
       ip: input.meta?.ip ?? null,
       userAgent: input.meta?.userAgent ?? null,
-      meta: { result: 'ok' },
+      meta: {
+        result: 'ok',
+        purpose: String(PURPOSE_PASSWORD_RESET),
+        expiresAt: expiresAt.toISOString(),
+      },
     });
 
-    if (process.env.NODE_ENV === 'test') {
-      return { token: rawToken };
-    }
-    return {};
+    return isTestEnv() ? { token: rawToken } : {};
   }
 
   async confirmPasswordReset(input: {
@@ -486,6 +556,7 @@ export class AuthService {
     newPassword: string;
     meta?: AuthMeta;
   }): Promise<void> {
+    // Minimal sanity; detailed password policy should be in DTO schema
     if (!input.newPassword || input.newPassword.length < 8) {
       throw new BadRequestException('Password too short');
     }
@@ -496,28 +567,27 @@ export class AuthService {
       meta: input.meta,
     });
 
-    const passwordHash = await argon2.hash(input.newPassword, {
-      type: argon2.argon2id,
-    });
+    const passwordHash = await this.hashPassword(input.newPassword);
 
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { passwordHash },
-      select: { id: true },
-    });
+    // Make the update + session invalidation consistent
+    await this.prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: userId },
+        data: { passwordHash },
+        select: { id: true },
+      });
 
-    // invalidate all sessions after password reset
-    await this.prisma.session.deleteMany({
-      where: { userId },
+      // Invalidate all sessions after password reset
+      await tx.session.deleteMany({ where: { userId } });
     });
 
     await this.audit.log({
       severity: 'SECURITY',
-      action: 'PASSWORD_RESET_REQUESTED',
+      action: 'PASSWORD_RESET_COMPLETED',
       actorId: userId,
       ip: input.meta?.ip ?? null,
       userAgent: input.meta?.userAgent ?? null,
-      meta: { result: 'confirmed', sessionsInvalidated: true },
+      meta: { result: 'ok', sessionsInvalidated: true },
     });
   }
 }

@@ -3,6 +3,7 @@ import 'dotenv/config';
 
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
+import { randomUUID } from 'crypto';
 import request from 'supertest';
 
 import {
@@ -20,11 +21,21 @@ function asHeadersLike(input: unknown): HeadersLike {
   return input as HeadersLike;
 }
 
+function shortId(len: number): string {
+  return randomUUID().replace(/-/g, '').slice(0, len);
+}
+
+function makeUsername(prefix = 'u'): string {
+  return `${prefix}_${shortId(18)}`; // <= 32 always
+}
+
 describe('Auth v1 (e2e-ish)', () => {
   let app: INestApplication;
 
   beforeAll(async () => {
-    process.env.NODE_ENV = 'development';
+    // IMPORTANT: tests must run in test env
+    process.env.NODE_ENV = 'test';
+    process.env.SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME ?? 'sid';
 
     const mod = await Test.createTestingModule({
       imports: [AppModule],
@@ -39,7 +50,7 @@ describe('Auth v1 (e2e-ish)', () => {
   });
 
   it('register -> sets session cookie', async () => {
-    const username = `u_${Date.now()}`;
+    const username = makeUsername('u');
     const email = `${username}@test.local`;
 
     const res = await request(getServer(app))

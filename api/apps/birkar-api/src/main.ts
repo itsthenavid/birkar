@@ -1,39 +1,27 @@
-import { Module } from '@nestjs/common';
-import { ThrottlerModule, seconds } from '@nestjs/throttler';
+// src/main.ts
+import { NestFactory } from '@nestjs/core';
+import cookieParser from 'cookie-parser';
 
-import { AppController } from './app.controller';
+import { AppModule } from './app.module';
+import { requestIdMiddleware } from './common/http/request-id';
+import { CsrfService } from './common/security/csrf.service';
+import { createCsrfCookieMiddleware } from './common/security/csrf/csrf.middleware';
 
-import { PrismaModule } from './modules/prisma/prisma.module';
-import { RedisModule } from './modules/redis/redis.module';
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
 
-import { AuthModule } from './modules/auth/auth.modules';
+  app.use(requestIdMiddleware);
 
-import { AuditModule } from './common/audit/audit.module';
-import { LockoutService } from './common/security/lockout.service';
-import { RedisThrottlerStorage } from './common/security/throttle/redis-throttler.storage';
-import { RedisService } from './modules/redis/redis.service';
+  // ✅ must be before csrf cookie middleware
+  app.use(cookieParser());
 
-@Module({
-  imports: [
-    PrismaModule,
-    RedisModule,
-    AuditModule,
+  // ✅ ensures csrf cookie exists in browser flows
+  const csrf = app.get(CsrfService);
+  app.use(createCsrfCookieMiddleware(csrf));
 
-    // Global throttling (distributed via Redis)
-    ThrottlerModule.forRootAsync({
-      inject: [RedisService],
-      useFactory: (redisSvc: RedisService) => ({
-        throttlers: [
-          // global sane defaults
-          { name: 'global', ttl: seconds(60), limit: 120 },
-        ],
-        storage: new RedisThrottlerStorage(redisSvc.redis),
-      }),
-    }),
+  // ... cors, filters, listen
+  const port = Number(process.env.PORT ?? 3000);
+  await app.listen(port);
+}
 
-    AuthModule,
-  ],
-  controllers: [AppController],
-  providers: [LockoutService],
-})
-export class AppModule {}
+void bootstrap();
